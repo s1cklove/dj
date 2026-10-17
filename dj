@@ -145,6 +145,87 @@ show_progress() {
   printf '\n' >&2
 }
 
+# Рисует N параллельных прогресс-баров из файлов ffmpeg -progress.
+# Завершается, когда во всех файлах появится progress=end.
+#   draw_parallel_progress N DURATION_MS... PROGRESS_FILE...
+draw_parallel_progress() {
+  local n=$1; shift
+  local -a durs=("${@:1:$n}")
+  local -a files=("${@:1+n}")
+
+  local tty=0 cols=80
+  if [[ -t 2 ]]; then
+    tty=1
+    cols=$(stty size <&2 2>/dev/null | cut -d' ' -f2) || true
+    (( ${cols:-0} > 0 )) || cols=80
+  fi
+
+  local start=$SECONDS first=1 done_count
+  local i line bar rest w fill el speed eta dur_ms f vals t_ms
+  local loop=''
+
+  while :; do
+    done_count=0
+    if (( tty && ! first )); then
+      printf '\033[%dA' "$n" >&2
+    fi
+    first=0
+
+    for (( i = 0; i < n; i++ )); do
+      dur_ms=${durs[$i]}
+      f=${files[$i]}
+
+      # out_time_ms в ffmpeg — на самом деле микросекунды (историческая
+      # особенность). Берём последнее значение из файла.
+      t_ms=0
+      if [[ -s $f ]]; then
+        vals=$(awk -F= '
+          /^out_time_ms=/ { t = $2 }
+          /^progress=/    { p = $2 }
+          END { print (t ~ /^[0-9]+$/ ? int(t / 1000) : 0), p }' "$f" 2>/dev/null) || vals='0 '
+        [[ $vals =~ ^([0-9]+)([[:space:]]|$) ]] && t_ms=${BASH_REMATCH[1]}
+        if [[ $vals == *' end' ]]; then
+          t_ms=$dur_ms
+          done_count=$(( done_count + 1 ))
+        fi
+      fi
+      (( dur_ms > 0 && t_ms > dur_ms )) && t_ms=$dur_ms
+
+      el=$(( SECONDS - start ))
+      speed='--'
+      (( el > 0 && t_ms > 0 )) && \
+        speed=$(awk -v t="$t_ms" -v e="$(( el * 1000 ))" \
+                     'BEGIN { printf "%.1fx", t / e }')
+
+      eta='--:--:--'
+      if (( dur_ms > 0 && t_ms >= dur_ms )); then
+        eta='0:00:00'
+      elif (( el > 0 && t_ms > 0 )); then
+        eta=$(fmt_time $(( el * (dur_ms - t_ms) / t_ms )))
+      fi
+
+      printf -v line ' [%d/%d] %s / %s  %6s  ETA %s' \
+        "$(( i + 1 ))" "$n" \
+        "$(fmt_time $(( t_ms / 1000 )))" \
+        "$(fmt_time $(( dur_ms / 1000 )))" \
+        "$speed" "$eta"
+
+      w=$(( cols - ${#line} - 3 ))
+      (( w > 30 )) && w=30
+      if (( w >= 10 && dur_ms > 0 )); then
+        fill=$(( w * t_ms / dur_ms ))
+        printf -v bar '%*s' "$fill" ''; bar=${bar// /█}
+        printf -v rest '%*s' $(( w - fill )) ''; bar+=${rest// /░}
+        line+=" $bar"
+      fi
+
+      (( tty )) && printf '\r\033[K%s\n' "${line:0:cols-1}" >&2
+    done
+
+    (( done_count == n )) && break
+    sleep 0.5
+  done
+}
 # Runs ffmpeg with a one-line progress bar instead of -stats (which wraps
 # in a narrow terminal, producing line after line).
 #   ffrun [--log FILE] DURATION ffmpeg-args...
@@ -245,7 +326,7 @@ run_batch() {
     set +e
     (
       set -e
-      trap 'rm -f -- "${cleanup[@]}"' EXIT
+      trap 'rm -rf -- "${cleanup[@]}"' EXIT
       trap 'exit 130' INT
       "$fn" "$in"
     )
@@ -516,6 +597,9 @@ Usage:
   $prog denoise [options] VIDEO|AUDIO|FOLDER...
 
 Options:
+  -j, --jobs N  split the input into N overlapping segments and denoise
+                them in parallel; requires at least N+1 CPU cores
+                (one is left free for the rest of the system). Default 1.
   --model M       model (default $DENOISE_DEFAULT_MODEL):
                     dpdfnet8_48khz_hr, dpdfnet2_48khz_hr — full band, 48 kHz;
                     dpdfnet8 / dpdfnet4 / dpdfnet2 / baseline — 16 kHz, lose the highs;
@@ -535,11 +619,12 @@ EOF
 }
 
 cmd_denoise() {
-  local model=$DENOISE_DEFAULT_MODEL limit='' args=()
+  local model=$DENOISE_DEFAULT_MODEL limit='' jobs=1 args=()
   while (( $# )); do
     case $1 in
       --model)         model=${2:?$1 requires a value}; shift ;;
       --limit)         limit=${2:?$1 requires a value}; shift ;;
+      -j|--jobs)       jobs=${2:?$1 requires a value}; shift ;;
       -o|--output)     output=${2:?$1 requires a value}; shift ;;
       -y|--overwrite)  overwrite=1 ;;
       -h|--help)       usage_denoise ;;
@@ -550,16 +635,106 @@ cmd_denoise() {
     shift
   done
   (( ${#args[@]} )) || usage_denoise
+  [[ $jobs =~ ^[0-9]+$ ]] && (( jobs >= 1 )) \
+    || die "-j expects a positive number: $jobs"
   [[ -n ${DENOISE_MODELS[$model]:-} ]] \
     || die "Unknown model: $model (see $prog denoise --help)"
   [[ -z $limit || $limit =~ ^[0-9]+([.][0-9]+)?$ ]] || die "--limit expects a number of dB: $limit"
   require ffmpeg ffprobe awk
   require_denoiser
 
+  if (( jobs > 1 )); then
+    local ncpu
+    ncpu=$(nproc 2>/dev/null) \
+      || ncpu=$(getconf _NPROCESSORS_ONLN 2>/dev/null) \
+      || ncpu=$(sysctl -n hw.ncpu 2>/dev/null) \
+      || ncpu=1
+    (( ncpu >= jobs + 1 )) \
+      || die "Not enough CPU cores: $ncpu online, need at least $(( jobs + 1 )) for -j $jobs (one core stays free)"
+  fi
+
   local rate=${DENOISE_MODELS[$model]}
   collect_inputs "${args[@]}"
-  printf 'Model: %s (%d kHz)%s\n' "$model" $(( rate / 1000 )) "${limit:+, at most $limit dB}" >&2
+  printf 'Model: %s (%d kHz)%s%s\n' "$model" $(( rate / 1000 )) \
+    "${limit:+, at most $limit dB}" "${jobs:+, $jobs jobs}" >&2
   run_batch denoise_one
+}
+
+# Splits the audio track of $1 into $jobs overlapping segments, runs the
+# denoiser on each in parallel, and writes the concatenated result to stdout
+# as raw f32le mono at the model rate. $2 — audio filter applied per segment.
+denoise_parallel_audio() {
+  local in=$1 af=$2
+
+  local duration total
+  duration=$(duration_of "$in")
+  total=$(awk -v d="$duration" -v r="$rate" 'BEGIN { printf "%d", d * r + 0.5 }')
+  (( total > 0 )) || die "Zero-length audio in: $in"
+  (( total / jobs >= rate )) || die "Audio is too short for $jobs jobs: $in"
+
+  local seg_len=$(( total / jobs ))
+  local overlap=$rate
+  (( overlap > seg_len / 2 )) && overlap=$(( seg_len / 2 ))
+  (( overlap < 1 )) && overlap=1
+
+  local tmpdir
+  tmpdir=$(mktemp -d)
+  cleanup+=("$tmpdir")
+
+  local pids=() i
+  local seg_start seg_end in_start in_end extra_skip emit_count ss t
+  local -a seg_durs=() progress_files=()
+
+  for (( i = 0; i < jobs; i++ )); do
+    seg_start=$(( i * seg_len ))
+    if (( i == jobs - 1 )); then
+      seg_end=$total
+    else
+      seg_end=$(( (i + 1) * seg_len ))
+    fi
+    in_start=$(( seg_start - overlap )); (( in_start < 0 )) && in_start=0
+    in_end=$(( seg_end + overlap ));     (( in_end > total )) && in_end=$total
+
+    extra_skip=$(( seg_start - in_start ))
+    emit_count=$(( seg_end - seg_start ))
+
+    ss=$(awk -v s="$in_start" -v r="$rate" 'BEGIN { printf "%.9f", s / r }')
+    t=$(awk  -v s="$in_end" -v e="$in_start" -v r="$rate" \
+                'BEGIN { printf "%.9f", (s - e) / r }')
+
+    seg_durs+=($(( emit_count * 1000 / rate )))
+    progress_files+=("$tmpdir/progress.$i")
+
+    (
+      export DJ_DENOISE_SKIP=$extra_skip DJ_DENOISE_EMIT=$emit_count
+      ffmpeg -hide_banner -nostdin -nostats -loglevel error \
+        -progress "$tmpdir/progress.$i" \
+        -ss "$ss" -i "$in" -t "$t" -map 0:a:0 -af "$af" \
+        -f f32le -ar "$rate" -ac 1 - \
+        | "${denoiser[@]}" "$model" ${limit:+"$limit"} \
+        > "$tmpdir/seg.$(printf '%04d' "$i").raw"
+    ) &
+    pids+=($!)
+  done
+
+  # По бару на задачу — только на терминале (как и в ffrun).
+  local monitor_pid=''
+  if [[ -t 2 ]]; then
+    draw_parallel_progress "$jobs" "${seg_durs[@]}" "${progress_files[@]}" &
+    monitor_pid=$!
+  fi
+
+  local rc=0 pid
+  for pid in "${pids[@]}"; do
+    wait "$pid" || rc=1
+  done
+  if [[ -n $monitor_pid ]]; then
+    kill "$monitor_pid" 2>/dev/null || true
+    wait "$monitor_pid" 2>/dev/null || true
+  fi
+  (( rc == 0 )) || die "Parallel denoise failed for: $in"
+
+  cat "$tmpdir"/seg.*.raw
 }
 
 denoise_one() {
@@ -584,17 +759,29 @@ denoise_one() {
     af=$(mono_filter "$channel_layout")
   fi
 
-  # Audio is streamed: ffmpeg → neural network → ffmpeg, no temporary files.
   local raw=(-f f32le -ar "$rate" -ac 1)
   echo "Denoising..." >&2
-  if [[ -n $has_video ]]; then
-    ffmpeg -hide_banner -nostdin -loglevel error -i "$in" -map 0:a:0 -af "$af" "${raw[@]}" - \
-      | "${denoiser[@]}" "$model" ${limit:+"$limit"} \
-      | mux_audio "$in" "$out" "${raw[@]}" -i pipe:0
+
+  if (( jobs > 1 )); then
+    # Parallel: split → N denoisers in parallel → cat → mux.
+    if [[ -n $has_video ]]; then
+      denoise_parallel_audio "$in" "$af" \
+        | mux_audio "$in" "$out" "${raw[@]}" -i pipe:0
+    else
+      denoise_parallel_audio "$in" "$af" \
+        | ffrun "$duration" "${raw[@]}" -i pipe:0 -c:a pcm_s16le "$part"
+    fi
   else
-    ffmpeg -hide_banner -nostdin -loglevel error -i "$in" -map 0:a:0 -af "$af" "${raw[@]}" - \
-      | "${denoiser[@]}" "$model" ${limit:+"$limit"} \
-      | ffrun "$duration" "${raw[@]}" -i pipe:0 -c:a pcm_s16le "$part"
+    # Serial (original streaming pipeline).
+    if [[ -n $has_video ]]; then
+      ffmpeg -hide_banner -nostdin -loglevel error -i "$in" -map 0:a:0 -af "$af" "${raw[@]}" - \
+        | "${denoiser[@]}" "$model" ${limit:+"$limit"} \
+        | mux_audio "$in" "$out" "${raw[@]}" -i pipe:0
+    else
+      ffmpeg -hide_banner -nostdin -loglevel error -i "$in" -map 0:a:0 -af "$af" "${raw[@]}" - \
+        | "${denoiser[@]}" "$model" ${limit:+"$limit"} \
+        | ffrun "$duration" "${raw[@]}" -i pipe:0 -c:a pcm_s16le "$part"
+    fi
   fi
   finish_output "$out"
 
