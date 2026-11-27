@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """DPDFNet noise removal for dj: reads mono float32 (f32le) from stdin, writes to stdout.
 
-Usage: dj-denoise.py MODEL [LIMIT_DB]
+Usage:
+  dj-denoise.py MODEL [LIMIT_DB]
+  dj-denoise.py --concat XFADE_SAMPLES SEG_RAW...
 
 Audio must come at the model's native sample rate (dj takes care of that).
 Processing is streamed, so memory doesn't grow with the recording length.
@@ -16,12 +18,44 @@ import os
 import sys
 
 import numpy as np
-from dpdfnet import StreamEnhancer
 
 CHUNK = 1 << 16  # samples per read
 
 
+def concat_segments(xfade, paths):
+    dst = sys.stdout.buffer
+    w = np.linspace(0.0, 1.0, xfade, endpoint=False, dtype=np.float32)
+    tail = None
+    for i, path in enumerate(paths):
+        is_last = i == len(paths) - 1
+        need_head = tail is not None
+        buf = np.zeros(0, np.float32)
+        with open(path, "rb") as f:
+            while chunk := f.read(CHUNK * 4):
+                buf = np.concatenate([buf, np.frombuffer(chunk, "<f4")])
+                if need_head:
+                    if len(buf) < xfade:
+                        continue
+                    mixed = tail * (1.0 - w) + buf[:xfade] * w
+                    dst.write(mixed.astype("<f4").tobytes())
+                    buf = buf[xfade:]
+                    need_head = False
+                keep = 0 if is_last else xfade
+                if len(buf) > keep:
+                    out_len = len(buf) - keep
+                    dst.write(buf[:out_len].astype("<f4").tobytes())
+                    buf = buf[out_len:]
+        tail = buf
+    dst.flush()
+
+
 def main():
+    if sys.argv[1] == "--concat":
+        concat_segments(int(sys.argv[2]), sys.argv[3:])
+        return
+
+    from dpdfnet import StreamEnhancer
+
     model = sys.argv[1]
     limit = float(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2] else None
     # Share of the original signal mixed into the cleaned one,
@@ -40,10 +74,10 @@ def main():
 
     src, dst = sys.stdin.buffer, sys.stdout.buffer
     noisy = np.zeros(0, np.float32)  # input not yet matched with output (for alpha)
-    # The overlap that was skipped in the output corresponds to the first
-    # `extra_skip` input samples, which must also be dropped from `noisy`.
-    noisy_skip = extra_skip
-    left = 0  # how many samples may still be emitted (unsegmented mode)
+    # The overlap skipped in the output corresponds to the first `extra_skip`
+    # input samples, which must also be dropped from `noisy` and `left`.
+    noisy_skip = extra_skip if alpha else 0
+    left = -extra_skip  # real segment samples read so far and not yet emitted
     emitted = 0  # total samples already written
 
     def emit(y):
@@ -53,19 +87,15 @@ def main():
         if noisy_skip:
             d = min(noisy_skip, len(noisy))
             noisy, noisy_skip = noisy[d:], noisy_skip - d
+        cap = max(0, left)
         if emit_total >= 0:
-            remaining = emit_total - emitted
-            if remaining <= 0:
-                return
-            if len(y) > remaining:
-                y = y[:remaining]
-        else:
-            y = y[:left]
+            cap = min(cap, emit_total - emitted)
+        y = y[:cap]
         if not len(y):
             return
         if alpha:
-            y = alpha * noisy[: len(y)] + (1 - alpha) * y
-            noisy = noisy[len(y) :]
+            y = alpha * noisy[:len(y)] + (1 - alpha) * y
+            noisy = noisy[len(y):]
         left -= len(y)
         emitted += len(y)
         dst.write(y.astype("<f4").tobytes())
